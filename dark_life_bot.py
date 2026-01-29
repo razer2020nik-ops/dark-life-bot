@@ -1,72 +1,95 @@
-# 🖤 dark Life — life-sim Telegram bot (Python)
-# Install: pip install -U python-telegram-bot==21.6
-#
-# Run (Windows CMD):
-#   set DARKLIFE_TOKEN=YOUR_TOKEN
+# 🖤 dark Life — upgraded life-sim Telegram bot (Python)
+# pip install -U python-telegram-bot==21.6
+# Run:
+#   export DARKLIFE_TOKEN="YOUR_TOKEN"
 #   python dark_life_bot.py
 #
-# Persistence: SQLite (darklife.db)
-# Buttons: status/inventory/work/eat/shop/rent/bank/city/sleep/event/top
+# Features:
+# - Levels & XP + job selection (higher level => better jobs)
+# - Businesses: buy/upgrade, daily income on sleep
+# - Crypto market: BTC/ETH/TON/USDT + fiat (RUB/USD/EUR), buy/sell, portfolio
+# - SQLite persistence
 
-import os
-import json
-import time
-import random
-import sqlite3
-from typing import Dict, Any, Tuple, Optional
+import os, json, time, random, sqlite3
+from typing import Dict, Any, Optional, Tuple, List
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-DB_PATH = os.environ.get("DARKLIFE_DB", "darklife.db")
 TOKEN = os.environ.get("DARKLIFE_TOKEN", "")
+DB_PATH = os.environ.get("DARKLIFE_DB", "darklife.db")
 
-# ---------- Game tuning ----------
-START_MONEY = 5000
+# ---------- Core caps ----------
 MAX_HEALTH = 100
-MAX_HUNGER = 100   # 0 = starving, 100 = full
+MAX_HUNGER = 100
 MAX_ENERGY = 100
-MAX_MOOD = 100
-MAX_STRESS = 100
 
-# time decay per hour (applied on user interaction based on last_seen timestamp)
+# decay per hour (real time)
 HUNGER_DECAY_PER_HOUR = 6
 ENERGY_DECAY_PER_HOUR = 4
-STRESS_GROW_PER_HOUR = 2
-MOOD_DROP_PER_HOUR = 1
 
-# bank interest per in-game day (on sleep)
-BANK_DAILY_INTEREST = 0.01  # 1%
+START_MONEY = 5000
 
-# ---------- SQLite ----------
+# ---------- Jobs (level gated) ----------
+# name, min_level, base_pay, xp_gain, energy_cost, hunger_cost
+JOBS = [
+    ("Разнорабочий", 1, 800, 14, 18, 12),
+    ("Курьер",       2, 1100, 18, 22, 15),
+    ("Бариста",      3, 1400, 22, 25, 14),
+    ("Охранник",     5, 1900, 28, 30, 16),
+    ("Слесарь",      7, 2400, 34, 34, 18),
+    ("Сисадмин",     10, 3200, 44, 30, 14),
+    ("Разработчик",  15, 4800, 62, 32, 12),
+]
+
+def xp_needed(level: int) -> int:
+    # мягкая прогрессия
+    return 60 + level * 45
+
+# ---------- Businesses ----------
+# id, name, buy_price, base_daily_income, upgrade_base_cost
+BUSINESSES = [
+    ("coffee",  "☕ Кофейня",          25000, 900,  6000),
+    ("shop",    "🏪 Магазин у дома",   45000, 1400, 9000),
+    ("carwash", "🚗 Автомойка",        80000, 2400, 15000),
+    ("it",      "💻 IT-студия",        160000, 5200, 28000),
+    ("club",    "🎶 Ночной клуб",      260000, 8800, 45000),
+]
+# income formula: base_daily_income * (1 + 0.35*(level-1))
+
+# ---------- Crypto market ----------
+ASSETS = [
+    ("RUB", "₽", "fiat"),
+    ("USD", "$", "fiat"),
+    ("EUR", "€", "fiat"),
+    ("BTC", "₿", "crypto"),
+    ("ETH", "Ξ", "crypto"),
+    ("TON", "💎", "crypto"),
+    ("USDT","🪙", "stable"),
+]
+# prices are quoted in RUB (simplify)
+DEFAULT_PRICES_RUB = {
+    "USD": 95.0,
+    "EUR": 103.0,
+    "BTC": 5_800_000.0,
+    "ETH": 280_000.0,
+    "TON": 220.0,
+    "USDT": 95.0,
+    "RUB": 1.0,
+}
+# random walk tuning
+CRYPTO_VOL = {"BTC": 0.020, "ETH": 0.028, "TON": 0.055, "USDT": 0.004, "USD": 0.010, "EUR": 0.012, "RUB": 0.0}
+
+# ---------- DB ----------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-def ensure_columns(conn: sqlite3.Connection) -> None:
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-    def add_col(name: str, sql_type: str, default_sql: str) -> None:
-        if name not in cols:
-            conn.execute(f"ALTER TABLE users ADD COLUMN {name} {sql_type} NOT NULL DEFAULT {default_sql}")
-
-    add_col("mood", "INTEGER", "60")
-    add_col("stress", "INTEGER", "20")
-    add_col("bank", "INTEGER", "0")
-
 def init_db() -> None:
     with db() as conn:
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
             money INTEGER NOT NULL,
             health INTEGER NOT NULL,
@@ -75,554 +98,675 @@ def init_db() -> None:
             day INTEGER NOT NULL,
             location TEXT NOT NULL,
             job TEXT NOT NULL,
+            level INTEGER NOT NULL,
+            xp INTEGER NOT NULL,
             inventory TEXT NOT NULL,
             last_seen INTEGER NOT NULL
         );
         """)
-        ensure_columns(conn)
-        conn.commit()
-
-def get_user(user_id: int) -> Optional[sqlite3.Row]:
-    with db() as conn:
-        cur = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        return cur.fetchone()
-
-def upsert_user(user_id: int, data: Dict[str, Any]) -> None:
-    with db() as conn:
         conn.execute("""
-        INSERT INTO users (
-            user_id, money, health, hunger, energy, day, location, job, inventory, last_seen, mood, stress, bank
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            money=excluded.money,
-            health=excluded.health,
-            hunger=excluded.hunger,
-            energy=excluded.energy,
-            day=excluded.day,
-            location=excluded.location,
-            job=excluded.job,
-            inventory=excluded.inventory,
-            last_seen=excluded.last_seen,
-            mood=excluded.mood,
-            stress=excluded.stress,
-            bank=excluded.bank
-        """, (
-            user_id,
-            data["money"], data["health"], data["hunger"], data["energy"],
-            data["day"], data["location"], data["job"], data["inventory"],
-            data["last_seen"], data.get("mood", 60), data.get("stress", 20), data.get("bank", 0)
-        ))
+        CREATE TABLE IF NOT EXISTS user_businesses(
+            user_id INTEGER NOT NULL,
+            biz_id TEXT NOT NULL,
+            biz_level INTEGER NOT NULL,
+            last_paid_day INTEGER NOT NULL,
+            PRIMARY KEY(user_id, biz_id)
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio(
+            user_id INTEGER NOT NULL,
+            asset TEXT NOT NULL,
+            amount REAL NOT NULL,
+            PRIMARY KEY(user_id, asset)
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS market(
+            key TEXT PRIMARY KEY,
+            value REAL NOT NULL
+        );
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS market_meta(
+            key TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        """)
+        # seed market
+        cur = conn.execute("SELECT COUNT(*) AS c FROM market").fetchone()["c"]
+        if cur == 0:
+            for k, v in DEFAULT_PRICES_RUB.items():
+                conn.execute("INSERT INTO market(key,value) VALUES(?,?)", (k, float(v)))
+        meta = conn.execute("SELECT COUNT(*) AS c FROM market_meta").fetchone()["c"]
+        if meta == 0:
+            conn.execute("INSERT INTO market_meta(key,value) VALUES('last_update', ?)", (int(time.time()),))
         conn.commit()
 
 # ---------- Helpers ----------
+def now_ts() -> int:
+    return int(time.time())
+
 def clamp(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
-def now_ts() -> int:
-    return int(time.time())
+def get_user(user_id: int) -> Optional[Dict[str, Any]]:
+    with db() as conn:
+        r = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return dict(r) if r else None
+
+def save_user(user_id: int, st: Dict[str, Any]) -> None:
+    with db() as conn:
+        conn.execute("""
+        INSERT INTO users(user_id, money, health, hunger, energy, day, location, job, level, xp, inventory, last_seen)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          money=excluded.money,
+          health=excluded.health,
+          hunger=excluded.hunger,
+          energy=excluded.energy,
+          day=excluded.day,
+          location=excluded.location,
+          job=excluded.job,
+          level=excluded.level,
+          xp=excluded.xp,
+          inventory=excluded.inventory,
+          last_seen=excluded.last_seen
+        """, (
+            user_id, st["money"], st["health"], st["hunger"], st["energy"], st["day"],
+            st["location"], st["job"], st["level"], st["xp"], st["inventory"], st["last_seen"]
+        ))
+        conn.commit()
 
 def default_state() -> Dict[str, Any]:
     return {
         "money": START_MONEY,
-        "bank": 0,
         "health": 90,
         "hunger": 70,
         "energy": 80,
-        "mood": 60,
-        "stress": 20,
         "day": 1,
         "location": "🚉 Вокзал",
         "job": "Безработный",
+        "level": 1,
+        "xp": 0,
         "inventory": json.dumps({"еда": 0, "аптечка": 0, "билет": 0}, ensure_ascii=False),
         "last_seen": now_ts(),
     }
 
-def get_inventory(state: Dict[str, Any]) -> Dict[str, int]:
+def inv_get(st: Dict[str, Any]) -> Dict[str, int]:
     try:
-        return json.loads(state["inventory"])
+        return json.loads(st["inventory"])
     except Exception:
         return {"еда": 0, "аптечка": 0, "билет": 0}
 
-def set_inventory(state: Dict[str, Any], inv: Dict[str, int]) -> None:
-    state["inventory"] = json.dumps(inv, ensure_ascii=False)
+def inv_set(st: Dict[str, Any], inv: Dict[str, int]) -> None:
+    st["inventory"] = json.dumps(inv, ensure_ascii=False)
 
-def is_dead(state: Dict[str, Any]) -> bool:
-    return state["health"] <= 0
-
-def apply_time_decay(state: Dict[str, Any], last_seen: int) -> Tuple[Dict[str, Any], str]:
-    """Apply hunger/energy/stress/mood changes based on real time passed since last interaction."""
-    dt = max(0, now_ts() - last_seen)
+def apply_decay(st: Dict[str, Any]) -> str:
+    last = int(st.get("last_seen", now_ts()))
+    dt = max(0, now_ts() - last)
     hours = dt / 3600.0
     if hours < 0.2:
-        state["last_seen"] = now_ts()
-        return state, ""
-
+        st["last_seen"] = now_ts()
+        return ""
     hunger_loss = int(hours * HUNGER_DECAY_PER_HOUR)
     energy_loss = int(hours * ENERGY_DECAY_PER_HOUR)
-    stress_gain = int(hours * STRESS_GROW_PER_HOUR)
-    mood_drop = int(hours * MOOD_DROP_PER_HOUR)
+    st["hunger"] = clamp(st["hunger"] - hunger_loss, 0, MAX_HUNGER)
+    st["energy"] = clamp(st["energy"] - energy_loss, 0, MAX_ENERGY)
 
-    if any([hunger_loss, energy_loss, stress_gain, mood_drop]):
-        state["hunger"] = clamp(state["hunger"] - hunger_loss, 0, MAX_HUNGER)
-        state["energy"] = clamp(state["energy"] - energy_loss, 0, MAX_ENERGY)
-        state["stress"] = clamp(state.get("stress", 20) + stress_gain, 0, MAX_STRESS)
-        state["mood"] = clamp(state.get("mood", 60) - mood_drop, 0, MAX_MOOD)
+    hp_loss = 0
+    if st["hunger"] <= 10: hp_loss += int(hours * 3)
+    if st["energy"] <= 10: hp_loss += int(hours * 2)
+    st["health"] = clamp(st["health"] - hp_loss, 0, MAX_HEALTH)
 
-        hp_loss = 0
-        if state["hunger"] <= 10:
-            hp_loss += int(hours * 3)
-        if state["energy"] <= 10:
-            hp_loss += int(hours * 2)
-        if state.get("stress", 0) >= 85:
-            hp_loss += int(hours * 2)
+    st["last_seen"] = now_ts()
+    note = f"⏳ Прошло ~{hours:.1f}ч: голод -{hunger_loss}, энергия -{energy_loss}."
+    if st["health"] <= 0:
+        note += "\n💀 Ты умер(ла). Нажми /start."
+    return note
 
-        state["health"] = clamp(state["health"] - hp_loss, 0, MAX_HEALTH)
-
-    state["last_seen"] = now_ts()
-
-    note = f"⏳ Прошло ~{hours:.1f} ч.: голод -{hunger_loss}, энергия -{energy_loss}, стресс +{stress_gain}, настроение -{mood_drop}."
-    if state["health"] == 0:
-        note += "\n💀 Ты умер(ла). Нажми /start чтобы начать заново."
-    return state, note
-
-def render_state(state: Dict[str, Any]) -> str:
+def render(st: Dict[str, Any]) -> str:
+    need = xp_needed(st["level"])
     return (
-        f"📍 Локация: {state['location']}\n"
-        f"📅 День: {state['day']}\n"
-        f"💼 Работа: {state['job']}\n\n"
-        f"💵 Наличные: {state['money']} ₽\n"
-        f"🏦 Банк: {state.get('bank', 0)} ₽\n\n"
-        f"❤️ Здоровье: {state['health']}/{MAX_HEALTH}\n"
-        f"🍗 Сытость: {state['hunger']}/{MAX_HUNGER}\n"
-        f"⚡ Энергия: {state['energy']}/{MAX_ENERGY}\n"
-        f"🙂 Настроение: {state.get('mood', 60)}/{MAX_MOOD}\n"
-        f"😰 Стресс: {state.get('stress', 20)}/{MAX_STRESS}\n"
+        f"📍 {st['location']} | 📅 День {st['day']}\n"
+        f"🧠 Уровень: {st['level']} (XP {st['xp']}/{need})\n"
+        f"💼 Работа: {st['job']}\n\n"
+        f"💰 Деньги: {st['money']} ₽\n"
+        f"❤️ {st['health']}/{MAX_HEALTH}  🍗 {st['hunger']}/{MAX_HUNGER}  ⚡ {st['energy']}/{MAX_ENERGY}\n"
     )
 
-# ---------- Keyboards ----------
+def maybe_level_up(st: Dict[str, Any]) -> str:
+    msg = ""
+    while st["xp"] >= xp_needed(st["level"]):
+        st["xp"] -= xp_needed(st["level"])
+        st["level"] += 1
+        msg += f"⬆️ *Уровень повышен!* Теперь ты {st['level']} lvl.\n"
+    return msg
+
+# ---------- Market ----------
+def market_update_if_needed() -> None:
+    with db() as conn:
+        last = conn.execute("SELECT value FROM market_meta WHERE key='last_update'").fetchone()
+        last_ts = int(last["value"]) if last else 0
+        if now_ts() - last_ts < 300:  # обновляем не чаще чем раз в 5 минут
+            return
+
+        prices = {r["key"]: float(r["value"]) for r in conn.execute("SELECT key,value FROM market")}
+        # random walk
+        for sym, _, _ in ASSETS:
+            if sym == "RUB":
+                prices[sym] = 1.0
+                continue
+            vol = CRYPTO_VOL.get(sym, 0.01)
+            drift = random.uniform(-vol, vol)
+            # USDT near USD
+            if sym == "USDT":
+                anchor = prices.get("USD", DEFAULT_PRICES_RUB["USD"])
+                prices[sym] = max(1.0, anchor * (1 + drift))
+            else:
+                prices[sym] = max(0.0001, prices.get(sym, DEFAULT_PRICES_RUB.get(sym, 1.0)) * (1 + drift))
+
+        for k, v in prices.items():
+            conn.execute("UPDATE market SET value=? WHERE key=?", (float(v), k))
+        conn.execute("UPDATE market_meta SET value=? WHERE key='last_update'", (now_ts(),))
+        conn.commit()
+
+def get_price(sym: str) -> float:
+    with db() as conn:
+        r = conn.execute("SELECT value FROM market WHERE key=?", (sym,)).fetchone()
+    return float(r["value"]) if r else float(DEFAULT_PRICES_RUB.get(sym, 1.0))
+
+def portfolio_get(user_id: int) -> Dict[str, float]:
+    with db() as conn:
+        rows = conn.execute("SELECT asset, amount FROM portfolio WHERE user_id=?", (user_id,)).fetchall()
+    d = {r["asset"]: float(r["amount"]) for r in rows}
+    if "RUB" not in d:
+        d["RUB"] = 0.0
+    return d
+
+def portfolio_set(user_id: int, asset: str, amount: float) -> None:
+    with db() as conn:
+        conn.execute("""
+        INSERT INTO portfolio(user_id, asset, amount)
+        VALUES(?,?,?)
+        ON CONFLICT(user_id, asset) DO UPDATE SET amount=excluded.amount
+        """, (user_id, asset, float(amount)))
+        conn.commit()
+
+# ---------- Businesses ----------
+def user_biz_list(user_id: int) -> List[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT biz_id, biz_level, last_paid_day FROM user_businesses WHERE user_id=?",
+            (user_id,)
+        ).fetchall()
+
+def user_biz_get(user_id: int, biz_id: str) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute(
+            "SELECT biz_id, biz_level, last_paid_day FROM user_businesses WHERE user_id=? AND biz_id=?",
+            (user_id, biz_id)
+        ).fetchone()
+
+def user_biz_upsert(user_id: int, biz_id: str, biz_level: int, last_paid_day: int) -> None:
+    with db() as conn:
+        conn.execute("""
+        INSERT INTO user_businesses(user_id, biz_id, biz_level, last_paid_day)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id, biz_id) DO UPDATE SET
+          biz_level=excluded.biz_level,
+          last_paid_day=excluded.last_paid_day
+        """, (user_id, biz_id, int(biz_level), int(last_paid_day)))
+        conn.commit()
+
+def biz_info(biz_id: str) -> Tuple[str, int, int, int]:
+    for _id, name, buy, inc, upc in BUSINESSES:
+        if _id == biz_id:
+            return name, buy, inc, upc
+    return ("❓", 10**9, 0, 10**9)
+
+def biz_income(base_income: int, lvl: int) -> int:
+    return int(base_income * (1 + 0.35 * max(0, lvl - 1)))
+
+def biz_upgrade_cost(base_cost: int, lvl: int) -> int:
+    # cost grows
+    return int(base_cost * (1.55 ** max(0, lvl - 1)))
+
+# ---------- UI Keyboards ----------
 def kb_main() -> InlineKeyboardMarkup:
-    rows = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📊 Статус", callback_data="status"),
          InlineKeyboardButton("🎒 Инвентарь", callback_data="inv")],
-        [InlineKeyboardButton("💼 Работа", callback_data="work"),
-         InlineKeyboardButton("🍜 Поесть", callback_data="eat_menu")],
-        [InlineKeyboardButton("🛒 Магазин", callback_data="shop_menu"),
-         InlineKeyboardButton("🏠 Жильё", callback_data="rent_menu")],
-        [InlineKeyboardButton("🏦 Банк", callback_data="bank_menu"),
-         InlineKeyboardButton("🏆 Топ", callback_data="top")],
-        [InlineKeyboardButton("🗺️ Город", callback_data="city"),
-         InlineKeyboardButton("😴 Сон", callback_data="sleep")],
-        [InlineKeyboardButton("🎲 Случай", callback_data="event")],
-    ]
-    return InlineKeyboardMarkup(rows)
+        [InlineKeyboardButton("💼 Работа", callback_data="work_menu"),
+         InlineKeyboardButton("🍜 Еда", callback_data="eat_menu")],
+        [InlineKeyboardButton("🏢 Бизнес", callback_data="biz_menu"),
+         InlineKeyboardButton("🪙 Крипта", callback_data="crypto_menu")],
+        [InlineKeyboardButton("😴 Сон (новый день)", callback_data="sleep"),
+         InlineKeyboardButton("🎲 Событие", callback_data="event")],
+    ])
 
 def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]])
-
-def kb_shop() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍞 Еда — 300₽", callback_data="buy_food"),
-         InlineKeyboardButton("🩹 Аптечка — 650₽", callback_data="buy_med")],
-        [InlineKeyboardButton("🎫 Билет — 900₽", callback_data="buy_ticket")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
-
-def kb_rent() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛏️ Хостел (700₽)", callback_data="rent_hostel"),
-         InlineKeyboardButton("🚪 Комната (1200₽)", callback_data="rent_room")],
-        [InlineKeyboardButton("🏢 Квартира (2400₽)", callback_data="rent_flat")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
-
-def kb_bank() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Положить 1000₽", callback_data="bank_deposit_1000"),
-         InlineKeyboardButton("➖ Снять 1000₽", callback_data="bank_withdraw_1000")],
-        [InlineKeyboardButton("➕ Положить всё", callback_data="bank_deposit_all"),
-         InlineKeyboardButton("➖ Снять всё", callback_data="bank_withdraw_all")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
-    ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="back")]])
 
 def kb_eat() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎒 Съесть из инвентаря", callback_data="eat_inv"),
          InlineKeyboardButton("🍽️ Кафе (450₽)", callback_data="eat_cafe")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_main")]
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
     ])
 
-# ---------- Core game actions ----------
-def do_work(state: Dict[str, Any]) -> str:
-    if state["energy"] < 20 or state["hunger"] < 15:
-        return "😵 Ты слишком голоден/уставший, чтобы работать. Поешь или поспишь."
+def kb_work(st: Dict[str, Any]) -> InlineKeyboardMarkup:
+    lvl = st["level"]
+    rows = []
+    for name, min_lvl, _, _, _, _ in JOBS:
+        if lvl >= min_lvl:
+            rows.append([InlineKeyboardButton(f"✅ {name} (с {min_lvl} lvl)", callback_data=f"job_set|{name}")])
+        else:
+            rows.append([InlineKeyboardButton(f"🔒 {name} (нужен {min_lvl} lvl)", callback_data="noop")])
+    rows.append([InlineKeyboardButton("🔨 Работать сейчас", callback_data="work_do")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
 
-    jobs = [
-        ("Разнорабочий", 800, 18, 12),
-        ("Курьер", 1100, 22, 15),
-        ("Бариста", 1400, 25, 14),
-    ]
-    if state["job"] == "Безработный":
-        state["job"] = random.choice([j[0] for j in jobs])
+def kb_biz_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 Купить бизнес", callback_data="biz_shop"),
+         InlineKeyboardButton("📈 Мои бизнесы", callback_data="biz_my")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
+    ])
 
-    j = next((x for x in jobs if x[0] == state["job"]), jobs[0])
-    base_pay, e_cost, h_cost = j[1], j[2], j[3]
+def kb_biz_shop(user_id: int) -> InlineKeyboardMarkup:
+    owned = {r["biz_id"] for r in user_biz_list(user_id)}
+    rows = []
+    for biz_id, name, buy_price, base_inc, _ in BUSINESSES:
+        if biz_id in owned:
+            rows.append([InlineKeyboardButton(f"✅ {name} (уже есть)", callback_data="noop")])
+        else:
+            rows.append([InlineKeyboardButton(f"{name} — {buy_price}₽", callback_data=f"biz_buy|{biz_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="biz_menu")])
+    return InlineKeyboardMarkup(rows)
 
-    # mood/stress affect pay
-    mood = state.get("mood", 60)
-    stress = state.get("stress", 20)
-    pay_mult = 1.0
-    if mood >= 75:
-        pay_mult += 0.10
-    if mood <= 25:
-        pay_mult -= 0.12
-    if stress >= 70:
-        pay_mult -= 0.15
-    if stress <= 20:
-        pay_mult += 0.05
+def kb_biz_my(user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    owned = user_biz_list(user_id)
+    if not owned:
+        rows.append([InlineKeyboardButton("Пусто 😅", callback_data="noop")])
+    else:
+        for r in owned:
+            biz_id = r["biz_id"]
+            name, _, base_inc, upc = biz_info(biz_id)
+            lvl = int(r["biz_level"])
+            inc = biz_income(base_inc, lvl)
+            cost = biz_upgrade_cost(upc, lvl+1)
+            rows.append([InlineKeyboardButton(f"{name} • lvl {lvl} • {inc}₽/день", callback_data=f"biz_view|{biz_id}")])
+            rows.append([InlineKeyboardButton(f"⬆️ Апгрейд ({cost}₽)", callback_data=f"biz_up|{biz_id}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="biz_menu")])
+    return InlineKeyboardMarkup(rows)
 
-    luck = random.randint(-150, 250)
-    earned = int(max(200, (base_pay + luck) * pay_mult))
+def kb_crypto_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📉 Рынок", callback_data="crypto_market"),
+         InlineKeyboardButton("💼 Портфель", callback_data="crypto_port")],
+        [InlineKeyboardButton("🟢 Купить", callback_data="crypto_buy_menu"),
+         InlineKeyboardButton("🔴 Продать", callback_data="crypto_sell_menu")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="back")]
+    ])
 
-    state["money"] += earned
-    state["energy"] = clamp(state["energy"] - e_cost, 0, MAX_ENERGY)
-    state["hunger"] = clamp(state["hunger"] - h_cost, 0, MAX_HUNGER)
+def kb_crypto_pick(action: str) -> InlineKeyboardMarkup:
+    # action = buy or sell
+    rows = []
+    for sym, icon, kind in ASSETS:
+        if sym == "RUB":
+            continue
+        rows.append([InlineKeyboardButton(f"{icon} {sym}", callback_data=f"crypto_{action}|{sym}")])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="crypto_menu")])
+    return InlineKeyboardMarkup(rows)
 
-    # stress up, mood down a bit
-    state["stress"] = clamp(stress + 6, 0, MAX_STRESS)
-    state["mood"] = clamp(mood - 2, 0, MAX_MOOD)
+def kb_crypto_amount(action: str, sym: str) -> InlineKeyboardMarkup:
+    # quick amounts in RUB for buy, units for sell (simplify)
+    if action == "buy":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Купить на 500₽", callback_data=f"crypto_buy_do|{sym}|500"),
+             InlineKeyboardButton("Купить на 2000₽", callback_data=f"crypto_buy_do|{sym}|2000")],
+            [InlineKeyboardButton("Купить на 10000₽", callback_data=f"crypto_buy_do|{sym}|10000")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="crypto_buy_menu")]
+        ])
+    else:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("Продать 10%", callback_data=f"crypto_sell_do|{sym}|0.1"),
+             InlineKeyboardButton("Продать 50%", callback_data=f"crypto_sell_do|{sym}|0.5")],
+            [InlineKeyboardButton("Продать 100%", callback_data=f"crypto_sell_do|{sym}|1.0")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="crypto_sell_menu")]
+        ])
 
-    return f"💼 Работа: {state['job']}\n✅ Заработок: +{earned} ₽ (учтены настроение/стресс + удача 🎲)"
-
-def do_eat_inv(state: Dict[str, Any]) -> str:
-    inv = get_inventory(state)
+# ---------- Actions ----------
+def do_eat_inv(st: Dict[str, Any]) -> str:
+    inv = inv_get(st)
     if inv.get("еда", 0) <= 0:
-        return "🎒 В инвентаре нет еды. Купи 🍞 в магазине."
+        return "🎒 Нет еды. Купи еду позже (можем добавить магазин — скажи)."
     inv["еда"] -= 1
-    set_inventory(state, inv)
-    state["hunger"] = clamp(state["hunger"] + 35, 0, MAX_HUNGER)
-    state["energy"] = clamp(state["energy"] + 5, 0, MAX_ENERGY)
-    state["mood"] = clamp(state.get("mood", 60) + 4, 0, MAX_MOOD)
-    state["stress"] = clamp(state.get("stress", 20) - 3, 0, MAX_STRESS)
-    return "🍜 Ты поел(а) (инвентарь): сытость +35, энергия +5, настроение +4, стресс -3."
+    inv_set(st, inv)
+    st["hunger"] = clamp(st["hunger"] + 35, 0, MAX_HUNGER)
+    st["energy"] = clamp(st["energy"] + 5, 0, MAX_ENERGY)
+    return "🍜 Поел(а) из инвентаря: сытость +35, энергия +5."
 
-def do_eat_cafe(state: Dict[str, Any]) -> str:
+def do_eat_cafe(st: Dict[str, Any]) -> str:
     cost = 450
-    if state["money"] < cost:
-        return f"🍽️ В кафе стоит {cost} ₽. Денег не хватает 😬"
-    state["money"] -= cost
-    state["hunger"] = clamp(state["hunger"] + 40, 0, MAX_HUNGER)
-    state["energy"] = clamp(state["energy"] + 8, 0, MAX_ENERGY)
-    state["mood"] = clamp(state.get("mood", 60) + 8, 0, MAX_MOOD)
-    state["stress"] = clamp(state.get("stress", 20) - 5, 0, MAX_STRESS)
-    return f"🍽️ Кафе: -{cost} ₽, сытость +40, энергия +8, настроение +8, стресс -5."
+    if st["money"] < cost:
+        return f"🍽️ Кафе стоит {cost}₽. Не хватает денег 😬"
+    st["money"] -= cost
+    st["hunger"] = clamp(st["hunger"] + 40, 0, MAX_HUNGER)
+    st["energy"] = clamp(st["energy"] + 8, 0, MAX_ENERGY)
+    return f"🍽️ Кафе: -{cost}₽, сытость +40, энергия +8."
 
-def do_sleep(state: Dict[str, Any]) -> str:
-    state["day"] += 1
+def do_work(st: Dict[str, Any]) -> str:
+    if st["job"] == "Безработный":
+        return "💼 Сначала выбери работу в меню 💼 Работа."
+    if st["energy"] < 20 or st["hunger"] < 15:
+        return "😵 Слишком голоден/уставший. Поешь или поспи."
 
-    # bank interest
-    bank = int(state.get("bank", 0))
-    interest = int(bank * BANK_DAILY_INTEREST)
-    if interest > 0:
-        state["bank"] = bank + interest
+    job = next((j for j in JOBS if j[0] == st["job"]), None)
+    if not job:
+        st["job"] = "Безработный"
+        return "🤔 Работа слетела. Выбери снова."
+    name, min_lvl, base_pay, xp_gain, e_cost, h_cost = job
+    if st["level"] < min_lvl:
+        return f"🔒 Эта работа требует {min_lvl} lvl. Выбери другую."
 
-    state["energy"] = clamp(state["energy"] + 55, 0, MAX_ENERGY)
-    state["hunger"] = clamp(state["hunger"] - 10, 0, MAX_HUNGER)
+    # pay random + small level bonus
+    luck = random.randint(-200, 350)
+    lvl_bonus = 1.0 + min(0.35, st["level"] * 0.01)
+    earned = int(max(200, (base_pay + luck) * lvl_bonus))
 
-    # mood +, stress -
-    state["mood"] = clamp(state.get("mood", 60) + 10, 0, MAX_MOOD)
-    state["stress"] = clamp(state.get("stress", 20) - 12, 0, MAX_STRESS)
+    st["money"] += earned
+    st["xp"] += xp_gain
+    st["energy"] = clamp(st["energy"] - e_cost, 0, MAX_ENERGY)
+    st["hunger"] = clamp(st["hunger"] - h_cost, 0, MAX_HUNGER)
 
-    # heal if not starving
-    if state["hunger"] >= 40:
-        state["health"] = clamp(state["health"] + 6, 0, MAX_HEALTH)
+    up = maybe_level_up(st)
+    return f"🔨 Ты отработал(а) как *{name}*.\n💸 +{earned}₽ | 🧠 +{xp_gain} XP\n{up}".strip()
 
-    extra = f"\n🏦 Банк начислил: +{interest} ₽" if interest > 0 else ""
-    return "😴 Сон: энергия +55, здоровье +6 (если не голоден), сытость -10, настроение +10, стресс -12. Новый день 🌅" + extra
+def do_sleep(st: Dict[str, Any], user_id: int) -> str:
+    st["day"] += 1
+    st["energy"] = clamp(st["energy"] + 55, 0, MAX_ENERGY)
+    st["hunger"] = clamp(st["hunger"] - 10, 0, MAX_HUNGER)
+    if st["hunger"] >= 40:
+        st["health"] = clamp(st["health"] + 6, 0, MAX_HEALTH)
 
-def rent_apply(state: Dict[str, Any], name: str, price: int, energy_bonus: int, mood_bonus: int, stress_delta: int) -> str:
-    if state["money"] < price:
-        return f"🏚️ {name} стоит {price} ₽. Не хватает денег 😬"
-    state["money"] -= price
-    state["energy"] = clamp(state["energy"] + energy_bonus, 0, MAX_ENERGY)
-    state["mood"] = clamp(state.get("mood", 60) + mood_bonus, 0, MAX_MOOD)
-    state["stress"] = clamp(state.get("stress", 20) + stress_delta, 0, MAX_STRESS)
-    state["location"] = "🏠 Дом"
-    return f"🏠 {name}: -{price} ₽, энергия +{energy_bonus}, настроение +{mood_bonus}, стресс {stress_delta:+}."
+    # businesses pay per day
+    total_income = 0
+    owned = user_biz_list(user_id)
+    for r in owned:
+        biz_id = r["biz_id"]
+        lvl = int(r["biz_level"])
+        last_paid = int(r["last_paid_day"])
+        if last_paid >= st["day"]:
+            continue
+        name, _, base_inc, _ = biz_info(biz_id)
+        inc = biz_income(base_inc, lvl)
+        total_income += inc
+        user_biz_upsert(user_id, biz_id, lvl, st["day"])
 
-def buy_item(state: Dict[str, Any], item: str, price: int, title: str) -> str:
-    if state["money"] < price:
-        return f"🛒 {title} стоит {price} ₽. Не хватает денег 😬"
-    inv = get_inventory(state)
-    inv[item] = inv.get(item, 0) + 1
-    set_inventory(state, inv)
-    state["money"] -= price
-    return f"🛒 Куплено: {title} (-{price} ₽)."
+    if total_income > 0:
+        st["money"] += total_income
+        return f"😴 Новый день 🌅\n🏢 Бизнесы принесли: +{total_income}₽"
+    return "😴 Новый день 🌅"
 
-def bank_deposit(state: Dict[str, Any], amount: int) -> str:
-    if amount <= 0:
-        return "🏦 Сумма должна быть > 0."
-    if state["money"] < amount:
-        return "🏦 Не хватает наличных."
-    state["money"] -= amount
-    state["bank"] = int(state.get("bank", 0)) + amount
-    return f"🏦 Положил(а) в банк: +{amount} ₽."
-
-def bank_withdraw(state: Dict[str, Any], amount: int) -> str:
-    bank = int(state.get("bank", 0))
-    if amount <= 0:
-        return "🏦 Сумма должна быть > 0."
-    if bank < amount:
-        return "🏦 Не хватает денег на счёте."
-    state["bank"] = bank - amount
-    state["money"] += amount
-    return f"🏦 Снял(а) с банка: +{amount} ₽ наличными."
-
-def do_city(state: Dict[str, Any]) -> str:
-    inv = get_inventory(state)
-    if inv.get("билет", 0) <= 0:
-        return "🗺️ Для поездки нужен 🎫 билет. Купи его в магазине."
-    inv["билет"] -= 1
-    set_inventory(state, inv)
-
-    places = ["🏙️ Центр", "🏭 Промзона", "🌳 Парк", "🎡 Площадь", "🧱 Спальник"]
-    state["location"] = random.choice(places)
-
-    money_delta = random.randint(-250, 450)
-    state["money"] = max(0, state["money"] + money_delta)
-    state["energy"] = clamp(state["energy"] - 10, 0, MAX_ENERGY)
-    state["hunger"] = clamp(state["hunger"] - 8, 0, MAX_HUNGER)
-
-    # mood/stress swing
-    state["mood"] = clamp(state.get("mood", 60) + random.randint(-4, 6), 0, MAX_MOOD)
-    state["stress"] = clamp(state.get("stress", 20) + random.randint(-2, 6), 0, MAX_STRESS)
-
-    return f"🗺️ Ты поехал(а) в {state['location']}.\n💸 По дороге деньги: {money_delta:+} ₽"
-
-def do_event(state: Dict[str, Any]) -> str:
-    inv = get_inventory(state)
-
-    def apply(delta: Dict[str, int]) -> None:
-        for k, v in delta.items():
-            if k == "money":
-                state["money"] = max(0, state["money"] + v)
-            elif k == "health":
-                state["health"] = clamp(state["health"] + v, 0, MAX_HEALTH)
-            elif k == "energy":
-                state["energy"] = clamp(state["energy"] + v, 0, MAX_ENERGY)
-            elif k == "hunger":
-                state["hunger"] = clamp(state["hunger"] + v, 0, MAX_HUNGER)
-            elif k == "mood":
-                state["mood"] = clamp(state.get("mood", 60) + v, 0, MAX_MOOD)
-            elif k == "stress":
-                state["stress"] = clamp(state.get("stress", 20) + v, 0, MAX_STRESS)
-
+def do_event(st: Dict[str, Any]) -> str:
     events = [
-        ("🧑‍🎤 Позвали подработать на концерте", "+900 ₽", {"money": +900, "energy": -12, "hunger": -6, "stress": +5, "mood": +3}),
-        ("🚓 Проверка документов", "-200 ₽ (штраф)", {"money": -200, "stress": +8, "mood": -2}),
-        ("🤕 Подвернул(а) ногу", "-12 ❤️", {"health": -12, "stress": +6, "mood": -4}),
-        ("🎁 Нашел(ла) кошелек", "+600 ₽", {"money": +600, "mood": +4}),
-        ("☕ Угостили кофе", "+10 ⚡", {"energy": +10, "mood": +2, "stress": -2}),
-        ("🗯️ Ссора на улице", "-6 🙂, +10 😰", {"mood": -6, "stress": +10}),
-        ("🧘 Нашел(ла) тихое место и выдохнул(а)", "+6 🙂, -8 😰", {"mood": +6, "stress": -8}),
+        ("🎁 Нашел кошелек", {"money": +600}),
+        ("🚓 Штраф", {"money": -200}),
+        ("🤕 Упал", {"health": -10}),
+        ("☕ Угостили кофе", {"energy": +10}),
+        ("🧑‍🎤 Подработка", {"money": +900, "energy": -10}),
     ]
+    title, delta = random.choice(events)
+    for k, v in delta.items():
+        if k == "money":
+            st["money"] = max(0, st["money"] + v)
+        elif k == "health":
+            st["health"] = clamp(st["health"] + v, 0, MAX_HEALTH)
+        elif k == "energy":
+            st["energy"] = clamp(st["energy"] + v, 0, MAX_ENERGY)
+    return f"🎲 Событие: {title}"
 
-    title, label, delta = random.choice(events)
+def biz_buy(st: Dict[str, Any], user_id: int, biz_id: str) -> str:
+    name, buy_price, _, _ = biz_info(biz_id)
+    if user_biz_get(user_id, biz_id):
+        return f"✅ {name} уже куплен."
+    if st["money"] < buy_price:
+        return f"❌ Не хватает денег на {name}. Нужно {buy_price}₽."
+    st["money"] -= buy_price
+    user_biz_upsert(user_id, biz_id, 1, st["day"])  # pay starts next day
+    return f"🏢 Куплен бизнес: {name} ✅"
 
-    healed = ""
-    if delta.get("health", 0) < 0 and inv.get("аптечка", 0) > 0:
-        inv["аптечка"] -= 1
-        set_inventory(state, inv)
-        apply({"health": +9, "stress": -2})
-        healed = " (использована 🩹 аптечка: +9 ❤️)"
+def biz_upgrade(st: Dict[str, Any], user_id: int, biz_id: str) -> str:
+    r = user_biz_get(user_id, biz_id)
+    name, _, base_inc, base_up = biz_info(biz_id)
+    if not r:
+        return "❌ У тебя нет этого бизнеса."
+    lvl = int(r["biz_level"])
+    cost = biz_upgrade_cost(base_up, lvl + 1)
+    if st["money"] < cost:
+        return f"❌ Апгрейд стоит {cost}₽. Не хватает денег."
+    st["money"] -= cost
+    new_lvl = lvl + 1
+    user_biz_upsert(user_id, biz_id, new_lvl, int(r["last_paid_day"]))
+    inc = biz_income(base_inc, new_lvl)
+    return f"⬆️ {name} улучшен до lvl {new_lvl}. Теперь приносит ~{inc}₽/день."
 
-    apply(delta)
-    return f"🎲 Событие: {title}\nРезультат: {label}{healed}"
-
-# ---------- Top ----------
-def get_top_text(limit: int = 10) -> str:
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT user_id, money, bank, (money + bank) as total FROM users ORDER BY total DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-
-    if not rows:
-        return "🏆 Пока никого нет в топе."
-    lines = ["🏆 *Топ игроков (нал+банк)*"]
-    for i, r in enumerate(rows, start=1):
-        lines.append(f"{i}. ID `{r['user_id']}` — {r['total']} ₽ (нал {r['money']}, банк {r['bank']})")
+def crypto_market_text() -> str:
+    market_update_if_needed()
+    lines = ["📉 *Рынок (в ₽)*"]
+    for sym, icon, _ in ASSETS:
+        if sym == "RUB": 
+            continue
+        p = get_price(sym)
+        lines.append(f"{icon} {sym}: {p:,.2f} ₽".replace(",", " "))
     return "\n".join(lines)
 
-# ---------- Telegram handlers ----------
+def crypto_port_text(user_id: int) -> str:
+    market_update_if_needed()
+    port = portfolio_get(user_id)
+    # show only non-zero
+    items = [(a, amt) for a, amt in port.items() if abs(amt) > 1e-9]
+    if not items:
+        return "💼 Портфель пуст."
+    total_rub = 0.0
+    lines = ["💼 *Портфель*"]
+    for asset, amt in items:
+        if asset == "RUB":
+            total_rub += amt
+            lines.append(f"₽ RUB: {amt:,.2f}".replace(",", " "))
+        else:
+            p = get_price(asset)
+            val = amt * p
+            total_rub += val
+            lines.append(f"{asset}: {amt:.6f} (~{val:,.2f} ₽)".replace(",", " "))
+    lines.append(f"\n🧾 Итого ~{total_rub:,.2f} ₽".replace(",", " "))
+    return "\n".join(lines)
+
+def crypto_buy(st: Dict[str, Any], user_id: int, sym: str, rub_amount: int) -> str:
+    market_update_if_needed()
+    if rub_amount <= 0:
+        return "❌ Сумма неверная."
+    if st["money"] < rub_amount:
+        return "❌ Не хватает денег."
+    price = get_price(sym)
+    units = rub_amount / price
+    st["money"] -= rub_amount
+    port = portfolio_get(user_id)
+    port[sym] = port.get(sym, 0.0) + units
+    portfolio_set(user_id, sym, port[sym])
+    return f"🟢 Куплено {sym}: {units:.6f} на {rub_amount}₽"
+
+def crypto_sell(st: Dict[str, Any], user_id: int, sym: str, fraction: float) -> str:
+    market_update_if_needed()
+    fraction = max(0.0, min(1.0, float(fraction)))
+    port = portfolio_get(user_id)
+    have = port.get(sym, 0.0)
+    if have <= 0:
+        return f"❌ У тебя нет {sym}."
+    sell_units = have * fraction
+    if sell_units <= 0:
+        return "❌ Нечего продавать."
+    price = get_price(sym)
+    rub = sell_units * price
+    port[sym] = have - sell_units
+    portfolio_set(user_id, sym, port[sym])
+    st["money"] += int(rub)
+    return f"🔴 Продано {sym}: {sell_units:.6f} (~{int(rub)}₽)"
+
+# ---------- Telegram ----------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     st = default_state()
-    upsert_user(user_id, st)
-
-    text = (
-        "🖤 *dark Life*\n\n"
-        "Ты приезжаешь на вокзал. Тебе выдали *5000 ₽* — дальше выживай как в жизни.\n\n"
-        + render_state(st)
-        + "\nВыбирай действие кнопками 👇"
+    save_user(user_id, st)
+    await update.message.reply_text(
+        "🖤 *dark Life*\n\nТы приехал(а) на вокзал. У тебя *5000₽*.\nЖиви как в реальной жизни.\n\n"
+        + render(st) + "\nВыбирай действие 👇",
+        parse_mode="Markdown",
+        reply_markup=kb_main()
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb_main())
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "Команды:\n"
-        "/start — новая жизнь\n"
-        "/help — помощь\n\n"
-        "Игра идёт через кнопки. Состояние сохраняется ✅"
-    )
+    await update.message.reply_text("/start — начать заново\n/help — помощь")
 
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_btn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
 
     user_id = q.from_user.id
-    row = get_user(user_id)
-    st = dict(row) if row else default_state()
+    st = get_user(user_id) or default_state()
 
-    # Apply real-time decay
-    st, decay_note = apply_time_decay(st, st.get("last_seen", now_ts()))
-
-    if is_dead(st):
-        upsert_user(user_id, st)
-        await q.edit_message_text("💀 Ты умер(ла). Нажми /start чтобы начать заново.")
+    note = apply_decay(st)
+    if st["health"] <= 0:
+        save_user(user_id, st)
+        await q.edit_message_text("💀 Ты умер(ла). Нажми /start.")
         return
 
-    action = q.data
+    data = q.data or ""
     msg = ""
-    reply_kb = kb_main()
+    kb = kb_main()
 
-    # navigation
-    if action == "back_main":
+    if data == "noop":
+        msg = "🤐"
+    elif data == "back":
         msg = "🏁 Главное меню"
-        reply_kb = kb_main()
-
-    # main
-    elif action == "status":
-        msg = "📊 *Твой статус*\n\n" + render_state(st)
-
-    elif action == "inv":
-        inv = get_inventory(st)
+    elif data == "status":
+        msg = "📊 *Статус*\n\n" + render(st)
+    elif data == "inv":
+        inv = inv_get(st)
         msg = "🎒 *Инвентарь*\n" + "\n".join([f"• {k}: {v}" for k, v in inv.items()])
-
-    elif action == "work":
-        msg = do_work(st)
-
-    elif action == "eat_menu":
-        msg = "🍜 *Еда*\nВыбирай:"
-        reply_kb = kb_eat()
-
-    elif action == "eat_inv":
+    elif data == "eat_menu":
+        msg = "🍜 *Еда*"
+        kb = kb_eat()
+    elif data == "eat_inv":
         msg = do_eat_inv(st)
-        reply_kb = kb_main()
-
-    elif action == "eat_cafe":
+    elif data == "eat_cafe":
         msg = do_eat_cafe(st)
-        reply_kb = kb_main()
 
-    elif action == "shop_menu":
-        msg = "🛒 *Магазин*\nВыбирай покупку:"
-        reply_kb = kb_shop()
+    elif data == "work_menu":
+        msg = "💼 *Работа*\nВыбери работу по уровню, затем жми «Работать сейчас»."
+        kb = kb_work(st)
+    elif data.startswith("job_set|"):
+        st["job"] = data.split("|", 1)[1]
+        msg = f"✅ Выбрана работа: *{st['job']}*"
+        kb = kb_work(st)
+    elif data == "work_do":
+        msg = do_work(st)
+        kb = kb_work(st)
 
-    elif action == "buy_food":
-        msg = buy_item(st, "еда", 300, "🍞 Еда")
-        reply_kb = kb_shop()
+    elif data == "biz_menu":
+        msg = "🏢 *Бизнес*"
+        kb = kb_biz_menu()
+    elif data == "biz_shop":
+        msg = "🛒 *Купить бизнес*"
+        kb = kb_biz_shop(user_id)
+    elif data == "biz_my":
+        msg = "📈 *Мои бизнесы*"
+        kb = kb_biz_my(user_id)
+    elif data.startswith("biz_buy|"):
+        biz_id = data.split("|", 1)[1]
+        msg = biz_buy(st, user_id, biz_id)
+        kb = kb_biz_shop(user_id)
+    elif data.startswith("biz_up|"):
+        biz_id = data.split("|", 1)[1]
+        msg = biz_upgrade(st, user_id, biz_id)
+        kb = kb_biz_my(user_id)
+    elif data.startswith("biz_view|"):
+        biz_id = data.split("|", 1)[1]
+        name, _, base_inc, base_up = biz_info(biz_id)
+        r = user_biz_get(user_id, biz_id)
+        if not r:
+            msg = "❌ Нет такого бизнеса."
+        else:
+            lvl = int(r["biz_level"])
+            inc = biz_income(base_inc, lvl)
+            cost = biz_upgrade_cost(base_up, lvl + 1)
+            msg = f"{name}\n📈 Уровень: {lvl}\n💵 Доход: ~{inc}₽/день\n⬆️ Апгрейд: {cost}₽"
+        kb = kb_biz_my(user_id)
 
-    elif action == "buy_med":
-        msg = buy_item(st, "аптечка", 650, "🩹 Аптечка")
-        reply_kb = kb_shop()
+    elif data == "crypto_menu":
+        msg = "🪙 *Крипта*"
+        kb = kb_crypto_menu()
+    elif data == "crypto_market":
+        msg = crypto_market_text()
+        kb = kb_crypto_menu()
+    elif data == "crypto_port":
+        msg = crypto_port_text(user_id)
+        kb = kb_crypto_menu()
+    elif data == "crypto_buy_menu":
+        msg = "🟢 *Купить* — выбери актив"
+        kb = kb_crypto_pick("buy")
+    elif data == "crypto_sell_menu":
+        msg = "🔴 *Продать* — выбери актив"
+        kb = kb_crypto_pick("sell")
+    elif data.startswith("crypto_buy|"):
+        sym = data.split("|", 1)[1]
+        msg = f"🟢 Купить {sym}: выбери сумму"
+        kb = kb_crypto_amount("buy", sym)
+    elif data.startswith("crypto_sell|"):
+        sym = data.split("|", 1)[1]
+        msg = f"🔴 Продать {sym}: выбери долю"
+        kb = kb_crypto_amount("sell", sym)
+    elif data.startswith("crypto_buy_do|"):
+        _, sym, amt = data.split("|")
+        msg = crypto_buy(st, user_id, sym, int(float(amt)))
+        kb = kb_crypto_menu()
+    elif data.startswith("crypto_sell_do|"):
+        _, sym, frac = data.split("|")
+        msg = crypto_sell(st, user_id, sym, float(frac))
+        kb = kb_crypto_menu()
 
-    elif action == "buy_ticket":
-        msg = buy_item(st, "билет", 900, "🎫 Билет")
-        reply_kb = kb_shop()
-
-    elif action == "rent_menu":
-        msg = "🏠 *Жильё*\nВыбирай где переночевать:"
-        reply_kb = kb_rent()
-
-    elif action == "rent_hostel":
-        msg = rent_apply(st, "Ночь в хостеле", 700, energy_bonus=20, mood_bonus=2, stress_delta=-3)
-        reply_kb = kb_rent()
-
-    elif action == "rent_room":
-        msg = rent_apply(st, "Комната на сутки", 1200, energy_bonus=30, mood_bonus=4, stress_delta=-5)
-        reply_kb = kb_rent()
-
-    elif action == "rent_flat":
-        msg = rent_apply(st, "Квартира на сутки", 2400, energy_bonus=45, mood_bonus=7, stress_delta=-8)
-        reply_kb = kb_rent()
-
-    elif action == "bank_menu":
-        msg = "🏦 *Банк*\nМожно хранить деньги и получать +1% за день (при сне)."
-        reply_kb = kb_bank()
-
-    elif action == "bank_deposit_1000":
-        msg = bank_deposit(st, 1000)
-        reply_kb = kb_bank()
-
-    elif action == "bank_withdraw_1000":
-        msg = bank_withdraw(st, 1000)
-        reply_kb = kb_bank()
-
-    elif action == "bank_deposit_all":
-        amt = int(st["money"])
-        msg = bank_deposit(st, amt) if amt > 0 else "🏦 Нечего класть."
-        reply_kb = kb_bank()
-
-    elif action == "bank_withdraw_all":
-        amt = int(st.get("bank", 0))
-        msg = bank_withdraw(st, amt) if amt > 0 else "🏦 Нечего снимать."
-        reply_kb = kb_bank()
-
-    elif action == "city":
-        msg = do_city(st)
-
-    elif action == "sleep":
-        msg = do_sleep(st)
-
-    elif action == "event":
+    elif data == "sleep":
+        msg = do_sleep(st, user_id)
+    elif data == "event":
         msg = do_event(st)
 
-    elif action == "top":
-        msg = get_top_text(10)
-        reply_kb = kb_back()
-
     else:
-        msg = "🤔 Неизвестное действие."
+        msg = "🤔 Не понял кнопку."
 
-    # If dead after action
-    if is_dead(st):
-        msg += "\n\n💀 Ты умер(ла). Нажми /start чтобы начать заново."
-
-    upsert_user(user_id, st)
+    save_user(user_id, st)
 
     full = (
         "🖤 *dark Life*\n"
-        + (f"{decay_note}\n\n" if decay_note else "")
+        + (f"{note}\n\n" if note else "")
         + msg
         + "\n\n"
-        + render_state(st)
+        + render(st)
         + "\nВыбирай действие 👇"
     )
-
-    await q.edit_message_text(full, parse_mode="Markdown", reply_markup=reply_kb)
+    await q.edit_message_text(full, parse_mode="Markdown", reply_markup=kb)
 
 def main() -> None:
     if not TOKEN:
-        raise SystemExit("Set env var DARKLIFE_TOKEN with your Telegram bot token.")
-
+        raise SystemExit("Set DARKLIFE_TOKEN env var.")
     init_db()
     app = Application.builder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CallbackQueryHandler(on_button))
-
-    print("🖤 dark Life is running... (Ctrl+C to stop)")
+    app.add_handler(CallbackQueryHandler(on_btn))
+    print("🖤 dark Life running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
